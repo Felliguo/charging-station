@@ -623,7 +623,7 @@
         <div class="signal-bar"></div>
         <div class="signal-bar"></div>
       </div>
-      <div class="bt-panel" id="btPanel" onclick="handleBtConnect()">
+      <div class="bt-panel" id="btPanel" onclick="handleBtConnect(false)">
         <div class="bt-dot" id="btDot"></div>
         <div class="bt-info">
           <div class="bt-status" id="btStatus">未連接主控站</div>
@@ -631,6 +631,7 @@
         </div>
         <span style="font-size:18px;">🔵</span>
       </div>
+      <button class="btn btn-ghost btn-sm" onclick="handleBtConnect(true)" title="找不到設備時使用：顯示所有 BLE 設備" style="font-size:12px;padding:4px 8px;">📡 掃描全部</button>
       <button class="btn btn-ghost btn-sm" onclick="toggleDemo()">🎮 演示模式</button>
     </div>
   </header>
@@ -1101,41 +1102,62 @@ function updateBothStations() {
 // ============================================================
 // BLUETOOTH
 // ============================================================
-// BLE UART Service UUID (Nordic UART / HM-10 compatible)
+// BLE UART Service UUID (Nordic UART / HM-10 / BLE-CC41-A compatible)
 const BLE_UART_SERVICE   = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
 const BLE_UART_TX_CHAR   = '6e400002-b5a3-f393-e0a9-e50e24dcca9e'; // write (central→peripheral)
 const BLE_UART_RX_CHAR   = '6e400003-b5a3-f393-e0a9-e50e24dcca9e'; // notify (peripheral→central)
 
-async function handleBtConnect() {
+// BLE 連線控制
+let autoReconnect = false;       // 是否自動重連（主動斷開時為 false）
+let reconnectTimer = null;       // 自動重連計時器
+const RECONNECT_DELAY_MS = 3000; // 重連等待時間 3 秒
+const GATT_MAX_RETRY = 3;        // GATT 最多重試次數
+
+// 掃描設備：標準模式（名稱 filter）或全設備模式
+async function handleBtConnect(scanAll = false) {
   if (btConnected) {
+    autoReconnect = false;
+    clearTimeout(reconnectTimer);
     disconnectBt();
     return;
   }
   setBtStatus('scanning');
-  logEntry('sys', '搜尋藍牙設備中…');
+  logEntry('sys', scanAll ? '搜尋全部 BLE 設備中…' : '搜尋已知 BLE 設備中…');
+
   try {
-    btDevice = await navigator.bluetooth.requestDevice({
-      // Web 只連接主桩 BLE 模組，主桩負責管理並轉發所有從桩狀態
-      filters: [
-        { namePrefix: 'MASTER' },
-        { namePrefix: 'HC' },
-        { namePrefix: 'HM' },
-        { namePrefix: 'EGO' },
-        { namePrefix: 'CHARGE' },
-      ],
-      optionalFilters: [{ services: [BLE_UART_SERVICE] }],
-      optionalServices: [BLE_UART_SERVICE],
-      acceptAllDevices: false,
-    });
+    const requestOptions = scanAll
+      ? {
+          // 全設備模式：顯示所有 BLE 設備讓用戶手動選
+          acceptAllDevices: true,
+          optionalServices: [BLE_UART_SERVICE],
+        }
+      : {
+          // 名稱 filter 模式：BLE-CC41-A(CC41-A/BT05) + HM-10 + 常見名稱
+          filters: [
+            { namePrefix: 'CC41' },   // BLE-CC41-A 預設名稱 CC41-A
+            { namePrefix: 'BT05' },   // BLE-CC41-A 另一常見名稱
+            { namePrefix: 'BT0' },    // BT05 / BT06 variants
+            { namePrefix: 'EGO' },    // EGO1 自定義名稱
+            { namePrefix: 'MASTER' }, // 自定義主桩名
+            { namePrefix: 'HM' },     // HM-10 / HM-11
+            { namePrefix: 'HC' },     // HC-05 / HC-06 (SPP fallback)
+            { namePrefix: 'CHARGE' }, // 充電桩自定義名稱
+          ],
+          optionalServices: [BLE_UART_SERVICE],
+        };
+
+    btDevice = await navigator.bluetooth.requestDevice(requestOptions);
   } catch(e) {
-    // User cancelled or no BLE
     if (e.name === 'NotFoundError') {
       logEntry('sys', '未找到設備或用戶取消');
-    } else if (e.message && e.message.includes('Bluetooth')) {
-      logEntry('err', '此瀏覽器不支援 Web Bluetooth API（請使用 Chrome/Edge）');
-      showAlert('error', '⚠ 請使用 Chrome 或 Edge 瀏覽器以啟用 Web Bluetooth API');
+      if (!scanAll) {
+        logEntry('sys', '💡 提示：如看不到設備，請點「掃描全部設備」');
+      }
+    } else if (e.name === 'NotSupportedError' || (e.message && e.message.includes('Bluetooth'))) {
+      logEntry('err', '此瀏覽器不支援 Web Bluetooth API');
+      showAlert('error', '⚠ 請使用 Android Chrome 瀏覽器（iOS 不支援 Web Bluetooth）');
     } else {
-      logEntry('err', '藍牙錯誤: ' + e.message);
+      logEntry('err', '藍牙掃描錯誤: ' + e.message);
     }
     setBtStatus('disconnected');
     return;
@@ -1143,31 +1165,47 @@ async function handleBtConnect() {
 
   btDevice.addEventListener('gattserverdisconnected', onBtDisconnected);
   logEntry('sys', `找到設備: ${btDevice.name || '(未命名)'}`);
+  autoReconnect = true;
+  await connectGatt();
+}
 
-  try {
-    const server = await btDevice.gatt.connect();
-    logEntry('ok', 'GATT 連接成功');
-    const service = await server.getPrimaryService(BLE_UART_SERVICE);
-    logEntry('ok', '獲取 UART Service');
+// GATT 連線（含重試）
+async function connectGatt() {
+  if (!btDevice) return;
+  for (let attempt = 1; attempt <= GATT_MAX_RETRY; attempt++) {
+    try {
+      logEntry('sys', `GATT 連線中… (第 ${attempt}/${GATT_MAX_RETRY} 次)`);
+      const server = await btDevice.gatt.connect();
+      logEntry('ok', 'GATT 連接成功');
 
-    // TX characteristic (we write to it)
-    btChar = await service.getCharacteristic(BLE_UART_TX_CHAR);
-    logEntry('ok', '獲取 TX Characteristic');
+      const service = await server.getPrimaryService(BLE_UART_SERVICE);
+      logEntry('ok', '獲取 UART Service');
 
-    // RX characteristic (we listen for notifications)
-    const rxChar = await service.getCharacteristic(BLE_UART_RX_CHAR);
-    await rxChar.startNotifications();
-    rxChar.addEventListener('characteristicvaluechanged', onBtData);
-    logEntry('ok', 'RX 通知已啟用');
+      btChar = await service.getCharacteristic(BLE_UART_TX_CHAR);
+      logEntry('ok', '獲取 TX Characteristic');
 
-    btConnected = true;
-    setBtStatus('connected', btDevice.name || '已連接');
-    showAlert('success', `✅ 藍牙已連接：${btDevice.name || '未命名設備'}`);
-    updateSignal(3);
-  } catch(e) {
-    logEntry('err', 'GATT 錯誤: ' + e.message);
-    setBtStatus('disconnected');
-    showAlert('error', '藍牙服務連接失敗，請確認設備支援 BLE UART');
+      const rxChar = await service.getCharacteristic(BLE_UART_RX_CHAR);
+      await rxChar.startNotifications();
+      rxChar.addEventListener('characteristicvaluechanged', onBtData);
+      logEntry('ok', 'RX 通知已啟用');
+
+      btConnected = true;
+      setBtStatus('connected', btDevice.name || '已連接');
+      showAlert('success', `✅ 藍牙已連接：${btDevice.name || '未命名設備'}`);
+      updateSignal(3);
+      return; // 成功，退出重試迴圈
+
+    } catch(e) {
+      logEntry('err', `GATT 嘗試 ${attempt} 失敗: ${e.message}`);
+      if (attempt < GATT_MAX_RETRY) {
+        logEntry('sys', `等待 1 秒後重試…`);
+        await new Promise(r => setTimeout(r, 1000));
+      } else {
+        setBtStatus('disconnected');
+        showAlert('error', `藍牙連接失敗（已重試 ${GATT_MAX_RETRY} 次）。請確認：\n1. 設備已開機並在範圍內\n2. 其他 APP（如 nRF Connect）已斷開連接\n3. 嘗試重新開關藍牙`);
+        autoReconnect = false;
+      }
+    }
   }
 }
 
@@ -1183,9 +1221,24 @@ function onBtDisconnected() {
   setBtStatus('disconnected');
   logEntry('err', '藍牙連接中斷');
   updateSignal(0);
+
+  // 自動重連（非主動斷開時）
+  if (autoReconnect && btDevice) {
+    logEntry('sys', `${RECONNECT_DELAY_MS / 1000} 秒後自動重連…`);
+    clearTimeout(reconnectTimer);
+    reconnectTimer = setTimeout(async () => {
+      if (!btConnected && autoReconnect && btDevice) {
+        logEntry('sys', '自動重連中…');
+        setBtStatus('scanning');
+        await connectGatt();
+      }
+    }, RECONNECT_DELAY_MS);
+  }
 }
 
 function disconnectBt() {
+  autoReconnect = false;
+  clearTimeout(reconnectTimer);
   if (btDevice && btDevice.gatt.connected) {
     btDevice.gatt.disconnect();
   }
@@ -1772,7 +1825,8 @@ window.addEventListener('load', () => {
   logEntry('sys', '充電桩管理系統已啟動');
   logEntry('sys', '通信架構：Web ←BLE→ 主桩(EGO1) ←UART→ 從桩1/從桩2');
   logEntry('sys', 'BLE 協議：Nordic UART Service UUID 6E400001');
-  logEntry('sys', '點擊右上角「連接主控站」配對主桩 BLE 模組(HM-10)');
+  logEntry('sys', '點擊「連接主控站」掃描 BLE-CC41-A / HM-10 等已知模組');
+  logEntry('sys', '找不到設備？點「📡 掃描全部」顯示所有藍牙設備');
   logEntry('sys', '或點擊側欄「▶ 自動演示」體驗完整狀態機流程');
 
   if (!navigator.bluetooth) {
