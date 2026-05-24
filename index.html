@@ -1135,6 +1135,7 @@ async function handleBtConnect(scanAll = false) {
           // 名稱 filter 模式：BLE-CC41-A(CC41-A/BT05) + HM-10 + 常見名稱
           filters: [
             { namePrefix: 'CC41' },   // BLE-CC41-A 預設名稱 CC41-A
+            { namePrefix: 'MLT' },    // MLT-BT05（你的模組實際名稱）
             { namePrefix: 'BT05' },   // BLE-CC41-A 另一常見名稱
             { namePrefix: 'BT0' },    // BT05 / BT06 variants
             { namePrefix: 'EGO' },    // EGO1 自定義名稱
